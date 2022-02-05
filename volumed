@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+
+import signal
+import buttonshim
+import os
+import time
+import threading
+import sys
+import urllib.parse
+import socket
+import uuid
+import re
+from io import BytesIO
+from sys import version_info
+
+HOST="127.0.0.1"
+PORT=9090
+
+#- Volumes that each curve was created for
+#- EQ settings should be name SOFT, LOW, MED, etc
+THRESH_SOFT=10
+THRESH_LOW=30
+THRESH_MED=45
+THRESH_HIGH=65
+THRESH_LOUD=80
+#- How fast to repeat VOL controls
+VOL_REPEAT=0.15
+#- Volume to set if we start at 0
+VOL_DEFAULT=THRESH_LOW
+#- Volume increment per press
+VOL_STEP=3
+VOL_SOFT_STEP= 1
+BASS=0
+TREBLE=0
+#- Relative volume for a tone change
+BASSINC=4
+TREBLEINC=4
+
+FIXED_EQ={}
+#- Names of the alsa EQ sliders
+EQ_IDX=[
+    "00. 31 Hz",
+    "01. 63 Hz",
+    "02. 125 Hz",
+    "03. 250 Hz",
+    "04. 500 Hz",
+    "05. 1 kHz",
+    "06. 2 kHz",
+    "07. 4 kHz",
+    "08. 8 kHz",
+    "09. 16 kHz"
+]
+
+# Curve coefficients
+low_a_curve=[0]*10
+low_b_curve=[0]*10
+low_c_curve=[0]*10
+hi_a_curve=[0]*10
+hi_b_curve=[0]*10
+hi_c_curve=[0]*10
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+MAC=':'.join(re.findall('..', '%012x' % uuid.getnode()))
+os.system("sudo modprobe i2c-dev")
+relative_vol = re.compile(r'[+-]')
+
+print("""
+Pimoroni button controller with Dynamic EQ!
+
+A = Vol Down
+B = Vol Up
+C = Next Track
+D = Prev Track
+E = Play/Pause
+
+C+A/B  = Adjust Treble
+C+A+B  = Reset Treble
+D+A/B  = Adjust Bass
+D+A+B  = Reset Bass
+Hold A = Vol Down Repeat
+Hold B = Vol Up Repeat
+Hold E = Random Playlist
+C+D    = Reset EQ
+A+B    = Mute
+
+Press Ctrl+C to exit.
+
+""")
+
+
+# Color definitions
+GREEN=[0x00,0x80,0x00]
+YELLOW=[0xFF,0xFF,0x00]
+RED=[0x80,0x00,0x00]
+ORANGE=[0xA0,0x70,0x00]
+CYAN=[0x00,0x80,0x80]
+PURPLE=[0xA0,0x00,0xA0]
+BRIGHT=[0x80,0xA0,0xFF]
+
+# Set the LED color
+def led(color):
+    global current_vol
+    global debounce_flag
+
+    buttonshim.set_pixel(*color)
+#    print (bcolors.OKBLUE + "SET LED COLOR:" + str(color) + bcolors.ENDC)
+
+# Debounce volume keys
+debounce_flag=False
+def debounce(mask):
+    global held
+    global debounce_flag
+    global t
+    held &= mask
+#    print(bcolors.WARNING + "Debounce: " + bin(held) + bcolors.ENDC)
+    if ( held != 0 ):
+        debounce_flag=True
+#        print (bcolors.WARNING + "DEBOUNCE ON" + bcolors.ENDC)
+    else:
+        if (debounce_flag):
+            if 't' in globals:
+                t.cancel()
+            t=threading.Timer(1.5,clear_debounce_flag)
+            t.start()
+
+# Load EQ values from alsa presets
+def load_fixed_eq():
+    global FIXED_EQ
+    with open("/home/tc/.alsaequal.presets") as myfile:
+        for line in myfile:
+            name, var = line.partition("=")[::2]
+            FIXED_EQ[name.strip()] = [int(i) for i in var.strip().strip('"').split()]
+
+def clear_debounce_flag():
+    global debounce_flag
+    debounce_flag=False
+#    print (bcolors.WARNING + "DEBOUNCE OFF" + bcolors.ENDC)
+
+def clear_rel_flag():
+    global rel_flag
+    global current_vol
+    global sync_vol
+    global t2
+    rel_flag = False
+    t2 = threading.Timer(2,sync_vol_change)
+    t2.start()
+
+def sync_vol_change():
+    current_vol = sync_vol
+    process_volume_change()
+
+# Execute an LMS CLI command
+def pcp_raw(string):
+    print (bcolors.OKCYAN + "\n>>> pcp_raw: " + string + bcolors.ENDC)
+    s.sendall ((string+"\n").encode("utf-8"))
+
+# Parse the LMS responses
+def pcp_response(string):
+    global current_vol
+    global relative_vol
+    global sync_vol
+    global t2
+    global rel_flag
+
+    response = urllib.parse.unquote(string.decode("utf-8")).strip()
+    print (bcolors.OKBLUE + "<<< Decoding: " + response + bcolors.ENDC)
+    result = response.split(' ')
+    if (len(result) > 1):
+        command = result[1]
+    else:
+        return
+    if (command == "mixer"):
+        if (result[2] == "muting"):
+           return
+        if (result[3] == "?"):
+           current_vol = 0
+        else:
+           if (relative_vol.match(result[3])):
+               print ("Relative volume " + result[3])
+               # current_vol already modified
+               rel_flag = True
+               new_vol = current_vol
+           else:
+               if (rel_flag):
+                   sync_vol = int(result[3])
+                   if 't2' in globals():
+                       t2.cancel()
+                   t2=threading.Timer(2.5,clear_rel_flag)
+                   t2.start()
+                   return
+               else:
+                   sync_vol = new_vol = int(result[3])
+           if (current_vol < 0):
+               if (new_vol == 0):
+                   current_vol = VOL_DEFAULT
+                   pcp_raw("mixer volume "+ str(current_vol))
+               else:
+                   current_vol = new_vol
+                   process_volume_change()
+           else:
+               if (current_vol != new_vol):
+                   current_vol = new_vol
+                   process_volume_change()
+    elif (command == "pause"):
+        pcp_raw("mode ?")
+    elif (command == "play"):
+        led(GREEN)
+    elif (command == "mode"):
+        mode = result[2]
+        if ((mode == "stop") or (mode == "pause")):
+            led(RED)
+        elif (mode == "play"):
+            if (current_vol > 0):
+                led(GREEN)
+            else:
+                led(ORANGE)
+        else:
+            led(YELLOW)
+#            print (bcolors.WARNING+"Unknown mode: " + mode+bcolors.ENDC)
+#    else:
+#        print (bcolors.WARNING+"Response: " + response + " not recognized"+bcolors.ENDC)
+
+# Select a volume preset or curve
+def process_volume_change():
+    global current_vol
+    global muted
+    global BASS
+    global TREBLE
+
+    if (current_vol < 1):
+        current_vol = 0
+        BASS = 0
+        TREBLE = 0
+        #muted = True
+        led(ORANGE)
+        return
+    print (bcolors.HEADER+("Volume changed! VOL:"+bcolors.WARNING+
+            bcolors.BOLD+"{}"+bcolors.ENDC+bcolors.HEADER+" Bass:{} Treb:{}")
+            .format(current_vol,BASS,TREBLE)+bcolors.ENDC)
+    if ((current_vol <= THRESH_SOFT) and (BASS == 0) and (TREBLE == 0)):
+        set_alsa_eq(FIXED_EQ["SOFT"])
+    elif ((current_vol == THRESH_LOW) and (BASS == 0) and (TREBLE == 0)):
+        set_alsa_eq(FIXED_EQ["LOW"])
+    elif ((current_vol == THRESH_MED) and (BASS == 0) and (TREBLE == 0)):
+        set_alsa_eq(FIXED_EQ["MED"])
+    elif ((current_vol == THRESH_HIGH) and (BASS == 0) and (TREBLE == 0)):
+        set_alsa_eq(FIXED_EQ["HIGH"])
+    elif ((current_vol >= THRESH_LOUD) and (BASS == 0) and (TREBLE == 0)):
+        set_alsa_eq(FIXED_EQ["LOUD"])
+    elif (current_vol < THRESH_MED):
+        set_alsa_eq (
+                build_alsa_eq (
+                        current_vol,
+                        low_a_curve,
+                        low_b_curve,
+                        low_c_curve
+                )
+        )
+    elif (current_vol >= THRESH_MED):
+        set_alsa_eq (
+                build_alsa_eq (
+                        current_vol,
+                        hi_a_curve,
+                        hi_b_curve,
+                        hi_c_curve
+                )
+        )
+
+
+# Compute EQ curve coefficients for 1 value
+def computeABC(x1,y1,x2,y2,x3,y3):
+    a_num=x1*(y3-y2)+x2*(y1-y3)+x3*(y2-y1)
+    a_den=(x1-x2)*(x1-x3)*(x2-x3)
+    a=a_num/a_den
+    b=((y2-y1)/(x2-x1))-a*(x1+x2)
+    c=y1-a*(x1*x1)-b*x1
+    return (a,b,c)
+
+# Compute EQ values given curve coefficients and volume
+def build_alsa_eq (vol,a,b,c):
+    global BASS
+    global TREBLE
+
+    y = [0]*10
+    for Hz in range(10):
+        if (Hz < 5):
+            rvol = vol - BASS
+        else:
+            rvol = vol - TREBLE
+        y[Hz] = round(a[Hz]*rvol*rvol+b[Hz]*rvol+c[Hz])
+    return y
+
+# Precompute coefficients for low volume curves
+def compute_low_curves():
+    global low_a_curve
+    global low_b_curve
+    global low_c_curve
+    global THRESH_SOFT
+    global THRESH_LOW
+    global THRESH_MED
+    global FIXED_EQ
+
+    lowvalues = FIXED_EQ["SOFT"]
+    medvalues = FIXED_EQ["LOW"]
+    highvalues = FIXED_EQ["MED"]
+
+    for Hz in range(10):
+        (a,b,c) = computeABC(
+                THRESH_SOFT,lowvalues[Hz],
+                THRESH_LOW,medvalues[Hz],
+                THRESH_MED,highvalues[Hz])
+        low_a_curve[Hz]=a
+        low_b_curve[Hz]=b
+        low_c_curve[Hz]=c
+
+# Precompute coefficients for high volume curves
+def compute_hi_curves():
+    global hi_a_curve
+    global hi_b_curve
+    global hi_c_curve
+    global THRESH_LOUD
+    global THRESH_MED
+    global THRESH_HIGH
+    global FIXED_EQ
+
+    lowvalues = FIXED_EQ["MED"]
+    medvalues = FIXED_EQ["HIGH"]
+    highvalues = FIXED_EQ["LOUD"]
+
+    for Hz in range(10):
+        (a,b,c) = computeABC(
+                THRESH_MED,lowvalues[Hz],
+                THRESH_HIGH,medvalues[Hz],
+                THRESH_LOUD,highvalues[Hz])
+        hi_a_curve[Hz]=a
+        hi_b_curve[Hz]=b
+        hi_c_curve[Hz]=c
+
+# Set alsa EQ given an array of percents
+def set_alsa_eq(percents):
+    print("Alsa EQ: " + str(percents))
+    index=0
+    for label in EQ_IDX: 
+        os.system ("sudo amixer -D equal set \"{}\" {}% >/dev/null".format(label,str(percents[index])))
+        index+=1
+
+# Convert basic commands to LMS CLI
+def pcp(command):
+    global debounce_flag
+    global current_vol
+    global held
+    global muted
+
+    if (debounce_flag):
+        print(bcolors.WARNING+"Debounce chord"+bcolors.ENDC)
+        return
+    if (command == "UNMUTE"):
+        muted = False
+        pcp_raw ("mixer muting 0")
+    elif (command == "MUTE"):
+        pcp_raw ("mixer muting 1")
+        muted = True
+    elif (command == "VOLUME DOWN"):
+        if (current_vol <= THRESH_SOFT):
+            current_vol -= VOL_SOFT_STEP
+            pcp_raw ("mixer volume -" + str(VOL_SOFT_STEP))
+        else:
+            current_vol -= VOL_STEP
+            pcp_raw ("mixer volume -" + str(VOL_STEP))
+        process_volume_change()
+    elif (command == "VOLUME UP"):
+        if (current_vol <= THRESH_SOFT):
+            current_vol += VOL_SOFT_STEP
+            pcp_raw ("mixer volume +" + str(VOL_SOFT_STEP))
+        else:
+            current_vol += VOL_STEP
+            pcp_raw ("mixer volume +" + str(VOL_STEP))
+        process_volume_change()
+    elif (command == "SKIP"):
+        pcp_raw ("playlist index +1")
+    elif (command == "PREVIOUS"):
+        pcp_raw ("playlist index -1")
+    elif (command == "PAUSE"):
+        pcp_raw ("pause")
+    elif (command == "SHUFFLE SONGS"):
+        pcp_raw ("randomplay tracks")
+    else:
+        print (bcolors.WARNING+"Unsupported command: '" + command +"'"+bcolors.ENDC)
+
+# Get current volume from LMS
+def query_volume():
+    pcp_raw ("mixer volume ?")
+    #- Let the main loop get the response
+
+# Vol Down button
+@buttonshim.on_press(buttonshim.BUTTON_A, repeat=True, repeat_time=VOL_REPEAT)
+def button_a(button, pressed):
+    global held
+    global mutex
+    global muted
+    global ToneChange
+    global BASS
+    global TREBLE
+
+    mutex.acquire()
+    held |= 0x01
+#    print("Press: " + str(button+1) + " B: " + bin(held))
+    if (muted):
+        led(YELLOW)
+        pcp("UNMUTE")
+        debounce(0xffff)
+    elif ( held == 0x03 ):
+        led(ORANGE)
+        pcp("MUTE")
+        debounce(0xffff)
+    elif ( held == 0x07 ):
+        led(BRIGHT)
+        TREBLE = 0
+        ToneChange = True
+        process_volume_change()
+        debounce(0xffff)
+    elif ( held == 0x0B ):
+        led(BRIGHT)
+        BASS = 0
+        ToneChange = True
+        process_volume_change()
+        debounce(0xffff)
+    elif ( held == 0x09 ):
+        led(RED)
+        BASS-=BASSINC
+        ToneChange = True
+        process_volume_change()
+    elif ( held == 0x05 ):
+        led(PURPLE)
+        TREBLE-=TREBLEINC
+        ToneChange = True
+        process_volume_change()
+    elif ( held == 0x01 ):
+        led(CYAN)
+        pcp("VOLUME DOWN")
+    mutex.release()
+	
+@buttonshim.on_hold(buttonshim.BUTTON_A, hold_time=1)
+def button_a_hold(button):
+    global held
+    global mutex
+
+    mutex.acquire()
+    held |= 0x01
+#    print("Press: " + str(button+1) + " B: " + bin(held))
+    mutex.release()
+
+@buttonshim.on_release(buttonshim.BUTTON_A)
+def button_a_rel(button, pressed):
+    global mutex
+
+    mutex.acquire()
+    debounce(0xfffe)
+#    print("Release: " + str(button+1) + " B: " + bin(held))
+    if (current_vol > 0):
+        led(GREEN)
+    mutex.release()
+
+# Vol Up button
+@buttonshim.on_press(buttonshim.BUTTON_B, repeat=True, repeat_time=VOL_REPEAT)
+def button_b(button, pressed):
+    global held
+    global mutex
+    global muted
+    global ToneChange
+    global BASS
+    global TREBLE
+    
+    mutex.acquire()
+
+    held |= 0x02
+#    print("Press: " + str(button+1) + " B: " + bin(held))
+    if (muted):
+        led(YELLOW)
+        pcp("UNMUTE")
+        debounce(0xffff)
+    elif ( held == 0x03 ):
+        led(ORANGE)
+        pcp("MUTE")
+        debounce(0xffff)
+    elif ( held == 0x07 ):
+        led(BRIGHT)
+        TREBLE = 0
+        ToneChange = True
+        process_volume_change()
+        debounce(0xffff)
+    elif ( held == 0x0B ):
+        led(BRIGHT)
+        BASS = 0
+        ToneChange = True
+        process_volume_change()
+        debounce(0xffff)
+    elif ( held == 0x0A ):
+        led(RED)
+        BASS+=BASSINC
+        ToneChange = True
+        process_volume_change()
+    elif ( held == 0x06 ):
+        led(PURPLE)
+        TREBLE+=TREBLEINC
+        ToneChange = True
+        process_volume_change()
+    elif ( held == 0x02 ):
+        led(CYAN)
+        pcp("VOLUME UP")
+    mutex.release()
+
+@buttonshim.on_release(buttonshim.BUTTON_B)
+def button_b_rel(button, pressed):
+    global mutex
+
+    mutex.acquire()
+    debounce(0xfffd)
+#    print("Release: " + str(button+1) + " B: " + bin(held))
+    led(GREEN)
+    mutex.release()
+
+# Skip Track Button
+@buttonshim.on_press(buttonshim.BUTTON_C)
+def button_c(button, pressed):
+    global mutex
+    global held
+
+    mutex.acquire()
+    led(YELLOW)   
+    held |= 0x04
+    mutex.release()
+
+@buttonshim.on_release(buttonshim.BUTTON_C)
+def button_c_release(button, pressed):
+    global mutex
+    global ToneChange
+    
+    mutex.acquire()
+    if (not ToneChange):
+        pcp("SKIP")
+    else:
+        ToneChange = False
+    debounce(0xfffb)
+    led(GREEN)
+    mutex.release()
+    
+# Prev Track Button
+@buttonshim.on_press(buttonshim.BUTTON_D)
+def button_d(button, pressed):
+    global mutex
+    global held
+
+    mutex.acquire()
+    led(YELLOW)
+    held |= 0x08
+    mutex.release()
+    
+@buttonshim.on_release(buttonshim.BUTTON_D)
+def button_d_release(button,pressed):
+    global mutex
+    global ToneChange
+
+    mutex.acquire()
+    if (not ToneChange):
+        pcp("PREVIOUS")
+    else:
+        ToneChange = False
+    debounce(0xfff7)
+    led(GREEN)
+    mutex.release()
+
+# Play / Pause Button
+@buttonshim.on_press(buttonshim.BUTTON_E)
+def button_e_press(button, pressed):
+    global mutex
+
+    mutex.acquire()
+    global held
+    held = False
+    led(YELLOW)
+    mutex.release()
+
+@buttonshim.on_release(buttonshim.BUTTON_E)
+def button_e_release(button,pressed):
+    global mutex
+
+    mutex.acquire()
+    if not held:
+        pcp("PAUSE")
+        led(GREEN)
+    mutex.release()
+
+@buttonshim.on_hold(buttonshim.BUTTON_E, hold_time=1)
+def button_e(button):
+    global held
+    global mutex
+
+    mutex.acquire()
+    held = button
+    led(PURPLE)
+    pcp("SHUFFLE SONGS")
+    pcp("SKIP")
+    time.sleep(0.2)
+    led(GREEN)
+    mutex.release()
+
+# Startup Code
+current_vol = -1
+rel_flag = False
+muted = False
+ToneChange = False
+held = 0x00
+led(RED)
+
+#- Load Dynamic EQ settings
+load_fixed_eq()
+compute_low_curves()
+compute_hi_curves()
+
+# Buttonshim runs threaded, so lock concurrent code
+mutex = threading.Lock()
+
+# Main Loop
+while True:
+    time.sleep(2)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((HOST, PORT))
+
+        pcp_raw("subscribe mixer,pause,play")    
+        query_volume();
+        led(GREEN)
+
+        with BytesIO() as buffer:
+            while True:
+                resp = s.recv(100)
+                buffer.write(resp)
+                buffer.seek(0)
+                start_index = 0
+                for line in buffer:
+                    start_index += len(line)
+                    pcp_response(line)
+
+                if start_index:
+                    buffer.seek(start_index)
+                    remaining = buffer.read()
+                    buffer.truncate(0)
+                    buffer.seek(0)
+                    buffer.write(remaining)
+                else:
+                    buffer.seek(0, 2)
+#                print ("Current Volume: " + str(current_vol))
+
+    time.sleep(5)    #- Hope LMS is restarted in 5 seconds
+

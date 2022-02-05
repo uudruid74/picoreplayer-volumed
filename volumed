@@ -128,7 +128,7 @@ def debounce(mask):
 #        print (bcolors.WARNING + "DEBOUNCE ON" + bcolors.ENDC)
     else:
         if (debounce_flag):
-            if 't' in globals:
+            if 't' in globals():
                 t.cancel()
             t=threading.Timer(1.5,clear_debounce_flag)
             t.start()

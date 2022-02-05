@@ -1,1 +1,3 @@
 # picoreplayer-volumed
+
+This combines code for Pimoroni Button Shim along with a dynamic EQ.  Just set a few EQ levels in .alsaequal.presets and what volumes those presets were designed for and the code will assume those points to be on a simple curve and will create appropriate slider levels at every volume change.  This works with any volume change but reacts fastest to button presses (it changes EQ before getting a server response).  Basic BASS/TREBLE are supported.  Just add this script to the startup.  You may need to edit config.txt to get the buttonshim working.   Feel free to contact me if you need help!
